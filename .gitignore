@@ -1,0 +1,4 @@
+naver_memos/
+__pycache__/
+*.pyc
+.DS_Store
