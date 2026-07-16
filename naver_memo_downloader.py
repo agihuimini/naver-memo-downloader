@@ -15,6 +15,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode
 
 try:
     from playwright.async_api import async_playwright
@@ -24,6 +25,7 @@ except ImportError:
 
 OUTPUT_DIR = Path("naver_memos")
 SIZE_PER_PAGE = 100
+UNCATEGORIZED = "미분류"
 
 
 def sanitize_filename(name: str) -> str:
@@ -33,6 +35,7 @@ def sanitize_filename(name: str) -> str:
 
 
 def format_datetime(ms) -> str:
+    """밀리초 타임스탬프 → 'YYYY-MM-DD HH:MM:SS'"""
     if not ms:
         return ''
     from datetime import datetime, timezone
@@ -71,6 +74,7 @@ def html_to_md(html: str) -> str:
 
 
 def memo_to_markdown(memo: dict) -> tuple[str, str]:
+    """메모 dict → (파일명, 마크다운 내용)"""
     plain = memo.get('memoPlainContent') or ''
     first_line = plain.strip().split('\n')[0].strip() if plain.strip() else ''
     content_html = memo.get('content') or ''
@@ -105,9 +109,8 @@ async def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
     print(f"저장 폴더: {OUTPUT_DIR.resolve()}\n")
 
-    # 페이지가 보낸 실제 요청 헤더 + 첫 응답 데이터 캡처
-    first_request: dict = {}   # {headers, body}
-    first_response: dict = {}  # {total, cursor, memos}
+    first_request: dict = {}
+    first_response: dict = {}
     all_memos: list[dict] = []
 
     async with async_playwright() as p:
@@ -135,8 +138,8 @@ async def main():
             return
         print("로그인 완료!\n")
 
-        # ── 2단계: 요청/응답 인터셉트 ──────────────────────────────
-        print("[2단계] 메모 서비스 로드 및 첫 API 호출 캡처 중...")
+        # ── 2단계: API 인터셉트 + 페이지 로드 ──────────────────────
+        print("[2단계] 메모 서비스 로드 중...")
 
         async def on_request(request):
             if "select/list" in request.url and not first_request:
@@ -162,12 +165,9 @@ async def main():
                 if memos and not first_response:
                     first_response['total'] = data.get('totalCount') or 0
                     first_response['cursor'] = data.get('nextCursor') or ''
-                    first_response['data_keys'] = list(data.keys())
                     all_memos.extend(memos)
-                    print(f"  첫 배치 캡처: {len(memos)}개 (전체 {data.get('totalCount')}개)")
-                    print(f"  data 키: {list(data.keys())}")
-                    print(f"  nextCursor: '{data.get('nextCursor')}'")
-            except Exception as e:
+                    print(f"  첫 배치: {len(memos)}개 (전체 {data.get('totalCount')}개)")
+            except Exception:
                 pass
 
         page.on("request", on_request)
@@ -177,32 +177,50 @@ async def main():
         await page.wait_for_load_state("networkidle")
         await asyncio.sleep(3)
 
+        # ── 3단계: 폴더 목록 조회 ───────────────────────────────────
+        print("\n[3단계] 폴더 목록 조회 중...")
+        folder_result = await page.evaluate("""
+            async () => {
+                try {
+                    const r = await fetch('/folder/folderList', {credentials: 'include'});
+                    return await r.json();
+                } catch(e) { return null; }
+            }
+        """)
+
+        # folderId → 폴더명 매핑
+        folder_map: dict[int, str] = {}
+        if folder_result and folder_result.get('code') == 'SUCCESS':
+            folders = (folder_result.get('data') or {}).get('folderList') or []
+            for f in folders:
+                fid = f.get('folderId')
+                fname = f.get('folderName') or f.get('name') or str(fid)
+                if fid is not None:
+                    folder_map[fid] = fname
+            print(f"  폴더 {len(folder_map)}개: {list(folder_map.values())}")
+        else:
+            print("  폴더 목록을 가져오지 못했습니다. 단일 폴더로 저장합니다.")
+
+        # ── 4단계: 나머지 메모 cursor 페이지네이션 ──────────────────
         total = first_response.get('total', 0)
         cursor = first_response.get('cursor', '')
-        print(f"\n  캡처된 요청 헤더: {list(first_request.get('headers', {}).keys())}")
-        print(f"  원본 body: {first_request.get('body', '')[:200]}")
 
-        # ── 3단계: cursor로 나머지 메모 가져오기 ───────────────────
         if total > len(all_memos) and first_request:
-            print(f"\n[3단계] 나머지 {total - len(all_memos)}개 다운로드...")
+            print(f"\n[4단계] 나머지 {total - len(all_memos)}개 다운로드...")
 
-            # 원본 헤더를 JS에서 사용할 수 있게 변환
             orig_headers = first_request.get('headers', {})
-            # fetch에 포함할 헤더 (민감한 헤더 제외, content-type 포함)
             safe_headers = {
                 k: v for k, v in orig_headers.items()
                 if k.lower() not in ('host', 'content-length', ':method', ':path', ':scheme', ':authority')
             }
             safe_headers['content-type'] = 'application/x-www-form-urlencoded'
-
             headers_js = json.dumps(safe_headers)
 
-            # 원본 body에서 파라미터 파싱 후 cursor/sizePerPage만 교체
-            from urllib.parse import parse_qs, urlencode
-            orig_body = first_request.get('body', '')
-            orig_params = {k: v[0] for k, v in parse_qs(orig_body, keep_blank_values=True).items()}
+            orig_params = {k: v[0] for k, v in parse_qs(
+                first_request.get('body', ''), keep_blank_values=True
+            ).items()}
             orig_params['sizePerPage'] = str(SIZE_PER_PAGE)
-            orig_params['excludeHtml'] = 'false'  # HTML 포함으로 변경
+            orig_params['excludeHtml'] = 'false'
 
             while len(all_memos) < total:
                 orig_params['cursor'] = cursor
@@ -223,7 +241,7 @@ async def main():
                 """)
 
                 if not result or result.get('error') or result.get('code') != 'SUCCESS':
-                    print(f"\n  오류: {json.dumps(result)[:300]}")
+                    print(f"\n  오류: {json.dumps(result)[:200]}")
                     break
 
                 data = result.get('data') or {}
@@ -231,14 +249,12 @@ async def main():
                 next_cursor = data.get('nextCursor') or ''
 
                 if not memos:
-                    print(f"\n  빈 응답. data 키: {list(data.keys())}")
                     break
 
                 all_memos.extend(memos)
                 print(f"  {len(all_memos)}/{total}개...", end='\r', flush=True)
 
                 if not next_cursor or next_cursor == cursor:
-                    print(f"\n  cursor 소진 (마지막 cursor='{next_cursor}')")
                     break
 
                 cursor = next_cursor
@@ -248,7 +264,7 @@ async def main():
 
         await browser.close()
 
-    # ── 4단계: 중복 제거 후 저장 ────────────────────────────────────
+    # ── 5단계: 폴더별로 분류해서 저장 ──────────────────────────────
     seen: set = set()
     unique: list[dict] = []
     for m in all_memos:
@@ -257,28 +273,42 @@ async def main():
             seen.add(mid)
             unique.append(m)
 
-    print(f"\n[4단계] 마크다운 저장 중... (총 {len(unique)}개)")
+    print(f"\n[5단계] 폴더별 마크다운 저장 중... (총 {len(unique)}개)")
 
     if not unique:
         print("저장할 메모가 없습니다.")
         return
 
+    # 폴더별 파일명 중복 카운터 (폴더 경로 포함)
     filename_counter: dict[str, int] = {}
+    folder_counts: dict[str, int] = {}
     saved = 0
 
     for memo in unique:
-        filename, content = memo_to_markdown(memo)
-        base = filename
-        cnt = filename_counter.get(base, 0) + 1
-        filename_counter[base] = cnt
-        if cnt > 1:
-            filename = f"{base}_{cnt}"
+        folder_id = memo.get('folderId')
+        folder_name = folder_map.get(folder_id, UNCATEGORIZED) if folder_map else UNCATEGORIZED
+        folder_dir = OUTPUT_DIR / sanitize_filename(folder_name)
+        folder_dir.mkdir(parents=True, exist_ok=True)
 
-        filepath = OUTPUT_DIR / f"{filename}.md"
+        filename, content = memo_to_markdown(memo)
+
+        # 같은 폴더 내 파일명 중복 처리
+        key = f"{folder_name}/{filename}"
+        cnt = filename_counter.get(key, 0) + 1
+        filename_counter[key] = cnt
+        if cnt > 1:
+            filename = f"{filename}_{cnt}"
+
+        filepath = folder_dir / f"{filename}.md"
         filepath.write_text(content, encoding="utf-8")
+        folder_counts[folder_name] = folder_counts.get(folder_name, 0) + 1
         saved += 1
 
-    print(f"\n완료! {saved}개 메모를 '{OUTPUT_DIR}/' 폴더에 저장했습니다.")
+    print()
+    print("폴더별 저장 결과:")
+    for fname, cnt in sorted(folder_counts.items()):
+        print(f"  {fname}/ → {cnt}개")
+    print(f"\n완료! 총 {saved}개 메모를 '{OUTPUT_DIR}/' 폴더에 저장했습니다.")
     print(f"경로: {OUTPUT_DIR.resolve()}")
 
 
