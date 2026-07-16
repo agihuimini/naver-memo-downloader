@@ -28,6 +28,29 @@ SIZE_PER_PAGE = 100
 UNCATEGORIZED = "미분류"
 
 
+def ask_filter_mode() -> str:
+    """
+    저장 방식 선택.
+    반환값: 'bulk' | 'split'
+    """
+    print("=" * 44)
+    print("  저장 방식을 선택하세요")
+    print("=" * 44)
+    print("  1) 일괄  — 폴더별로만 분류해서 저장")
+    print("  2) 구별  — 폴더 안을 '중요 / 일반'으로 나눠서 저장")
+    print()
+
+    while True:
+        choice = input("선택 (1/2): ").strip()
+        if choice == "1":
+            print("→ '일괄' 모드로 실행합니다.\n")
+            return "bulk"
+        if choice == "2":
+            print("→ '구별' 모드로 실행합니다.\n")
+            return "split"
+        print("1 또는 2를 입력해 주세요.")
+
+
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[\\/*?:"<>|\n\r\t]', '_', name).strip()
     name = re.sub(r'_+', '_', name).strip('_')
@@ -106,6 +129,8 @@ def memo_to_markdown(memo: dict) -> tuple[str, str]:
 
 
 async def main():
+    filter_mode = ask_filter_mode()  # 'all' | 'important' | 'normal'
+
     OUTPUT_DIR.mkdir(exist_ok=True)
     print(f"저장 폴더: {OUTPUT_DIR.resolve()}\n")
 
@@ -273,41 +298,46 @@ async def main():
             seen.add(mid)
             unique.append(m)
 
-    print(f"\n[5단계] 폴더별 마크다운 저장 중... (총 {len(unique)}개)")
+    mode_label = "일괄" if filter_mode == "bulk" else "구별"
+    print(f"\n[5단계] 마크다운 저장 중... ({mode_label} / 총 {len(unique)}개)")
 
     if not unique:
         print("저장할 메모가 없습니다.")
         return
 
-    # 폴더별 파일명 중복 카운터 (폴더 경로 포함)
     filename_counter: dict[str, int] = {}
-    folder_counts: dict[str, int] = {}
+    dir_counts: dict[str, int] = {}
     saved = 0
 
     for memo in unique:
         folder_id = memo.get('folderId')
         folder_name = folder_map.get(folder_id, UNCATEGORIZED) if folder_map else UNCATEGORIZED
-        folder_dir = OUTPUT_DIR / sanitize_filename(folder_name)
-        folder_dir.mkdir(parents=True, exist_ok=True)
+
+        if filter_mode == "split":
+            sub = "중요" if memo.get('important') else "일반"
+            save_dir = OUTPUT_DIR / sanitize_filename(folder_name) / sub
+        else:
+            save_dir = OUTPUT_DIR / sanitize_filename(folder_name)
+
+        save_dir.mkdir(parents=True, exist_ok=True)
 
         filename, content = memo_to_markdown(memo)
 
-        # 같은 폴더 내 파일명 중복 처리
-        key = f"{folder_name}/{filename}"
+        key = str(save_dir / filename)
         cnt = filename_counter.get(key, 0) + 1
         filename_counter[key] = cnt
         if cnt > 1:
             filename = f"{filename}_{cnt}"
 
-        filepath = folder_dir / f"{filename}.md"
-        filepath.write_text(content, encoding="utf-8")
-        folder_counts[folder_name] = folder_counts.get(folder_name, 0) + 1
+        (save_dir / f"{filename}.md").write_text(content, encoding="utf-8")
+        dir_key = str(save_dir.relative_to(OUTPUT_DIR))
+        dir_counts[dir_key] = dir_counts.get(dir_key, 0) + 1
         saved += 1
 
     print()
-    print("폴더별 저장 결과:")
-    for fname, cnt in sorted(folder_counts.items()):
-        print(f"  {fname}/ → {cnt}개")
+    print("저장 결과:")
+    for path, cnt in sorted(dir_counts.items()):
+        print(f"  {path}/ → {cnt}개")
     print(f"\n완료! 총 {saved}개 메모를 '{OUTPUT_DIR}/' 폴더에 저장했습니다.")
     print(f"경로: {OUTPUT_DIR.resolve()}")
 
