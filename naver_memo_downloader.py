@@ -324,10 +324,16 @@ async def main():
         filename, content = memo_to_markdown(memo)
 
         key = str(save_dir / filename)
-        cnt = filename_counter.get(key, 0) + 1
-        filename_counter[key] = cnt
-        if cnt > 1:
-            filename = f"{filename}_{cnt}"
+        if key in filename_counter:
+            # 중복 시 생성일시를 접미사로 붙여 구분
+            created = format_datetime(memo.get('createdTime'))
+            dt_suffix = created.replace('-', '').replace(':', '').replace(' ', '_') if created else ''
+            filename = f"{filename}_{dt_suffix}" if dt_suffix else f"{filename}_{memo.get('memoSeq', id(memo))}"
+            # 생성일시도 같은 극단적 중복은 memoSeq로 보장
+            key2 = str(save_dir / filename)
+            if key2 in filename_counter:
+                filename = f"{filename}_{memo.get('memoSeq', id(memo))}"
+        filename_counter[str(save_dir / filename)] = True
 
         (save_dir / f"{filename}.md").write_text(content, encoding="utf-8")
         dir_key = str(save_dir.relative_to(OUTPUT_DIR))
